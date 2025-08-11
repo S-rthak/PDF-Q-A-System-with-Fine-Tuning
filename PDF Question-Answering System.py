@@ -1,268 +1,420 @@
-# PDF Question-Answering System with Fine-tuning
-# Requirements: streamlit, langchain, PyPDF2, sentence-transformers, faiss-cpu, openai
-
+# main.py - Complete RAG System with File Upload and Q&A
 import streamlit as st
-import PyPDF2
-import io
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-import pickle
 import os
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.llms import OpenAI
-from langchain.document_loaders import PyPDFLoader
-from langchain.schema import Document
 import tempfile
+import warnings
+warnings.filterwarnings('ignore')
 
-# Configuration
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+import torch
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings
+from ctransformers import AutoModelForCausalLM
+import numpy as np
+from typing import List, Dict, Any
+import PyPDF2
+from docx import Document
+import io
+from pathlib import Path
+import time
 
-class PDFQASystem:
+# Page config
+st.set_page_config(
+    page_title="RAG Document Q&A System",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+class DocumentProcessor:
+    """Handle document loading and text extraction"""
+    
     def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-        self.vector_store = None
-        self.qa_chain = None
+        self.supported_formats = ['.pdf', '.txt', '.docx']
+    
+    def load_pdf(self, file_bytes: bytes) -> str:
+        """Extract text from PDF file bytes"""
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    
+    def load_docx(self, file_bytes: bytes) -> str:
+        """Extract text from DOCX file bytes"""
+        doc = Document(io.BytesIO(file_bytes))
+        text = ""
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        return text
+    
+    def load_txt(self, file_bytes: bytes) -> str:
+        """Load text from TXT file bytes"""
+        return file_bytes.decode('utf-8')
+    
+    def load_document(self, file_name: str, file_bytes: bytes) -> str:
+        """Load document based on file extension"""
+        extension = Path(file_name).suffix.lower()
         
-    def extract_text_from_pdf(self, pdf_file):
-        """Extract text from uploaded PDF file"""
-        try:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            return text
-        except Exception as e:
-            st.error(f"Error extracting text from PDF: {str(e)}")
-            return None
+        if extension == '.pdf':
+            return self.load_pdf(file_bytes)
+        elif extension == '.docx':
+            return self.load_docx(file_bytes)
+        elif extension == '.txt':
+            return self.load_txt(file_bytes)
+        else:
+            raise ValueError(f"Unsupported file format: {extension}")
+
+class TextChunker:
+    """Split documents into manageable chunks"""
     
-    def create_chunks(self, text):
-        """Split text into chunks for better processing"""
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", " ", ""]
-        )
-        chunks = text_splitter.split_text(text)
-        return [Document(page_content=chunk) for chunk in chunks]
+    def __init__(self, chunk_size: int = 1000, overlap: int = 200):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
     
-    def create_vector_store(self, documents):
-        """Create FAISS vector store from documents"""
-        try:
-            self.vector_store = FAISS.from_documents(documents, self.embeddings)
-            return True
-        except Exception as e:
-            st.error(f"Error creating vector store: {str(e)}")
-            return False
-    
-    def setup_qa_chain(self, openai_api_key=None):
-        """Setup the question-answering chain"""
-        try:
-            if openai_api_key:
-                llm = OpenAI(temperature=0, openai_api_key=openai_api_key)
-            else:
-                # Use Hugging Face pipeline as fallback
-                from transformers import pipeline
-                qa_pipeline = pipeline(
-                    "question-answering",
-                    model="distilbert-base-cased-distilled-squad",
-                    tokenizer="distilbert-base-cased-distilled-squad"
-                )
-                return qa_pipeline
+    def chunk_text(self, text: str) -> List[str]:
+        """Split text into overlapping chunks"""
+        words = text.split()
+        chunks = []
+        
+        for i in range(0, len(words), self.chunk_size - self.overlap):
+            chunk = ' '.join(words[i:i + self.chunk_size])
+            if chunk.strip():  # Only add non-empty chunks
+                chunks.append(chunk)
             
-            self.qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=self.vector_store.as_retriever(search_kwargs={"k": 3}),
-                return_source_documents=True
-            )
-            return True
-        except Exception as e:
-            st.error(f"Error setting up QA chain: {str(e)}")
-            return False
+            # Break if we've reached the end
+            if i + self.chunk_size >= len(words):
+                break
+                
+        return chunks
+
+@st.cache_resource
+def load_embedding_model(model_name: str = "all-MiniLM-L6-v2"):
+    """Load and cache embedding model"""
+    return SentenceTransformer(model_name)
+
+class ChromaVectorStore:
+    """Chroma vector database for document storage and retrieval"""
     
-    def answer_question(self, question, use_openai=True, openai_api_key=None):
-        """Answer question based on the PDF content"""
-        if not self.vector_store:
-            return "Please upload and process a PDF first."
+    def __init__(self, collection_name: str = "documents"):
+        self.collection_name = collection_name
+        
+        # Initialize Chroma client (in-memory for Streamlit)
+        self.client = chromadb.Client()
+        
+        # Create or get collection
+        try:
+            self.collection = self.client.get_collection(name=collection_name)
+        except:
+            self.collection = self.client.create_collection(name=collection_name)
+    
+    def clear_collection(self):
+        """Clear the collection for new documents"""
+        try:
+            self.client.delete_collection(name=self.collection_name)
+            self.collection = self.client.create_collection(name=self.collection_name)
+        except:
+            pass
+    
+    def add_documents(self, texts: List[str], embeddings: np.ndarray, metadatas: List[Dict] = None):
+        """Add documents to the vector store"""
+        ids = [f"doc_{i}_{int(time.time())}" for i in range(len(texts))]
+        
+        if metadatas is None:
+            metadatas = [{"source": f"document_{i}"} for i in range(len(texts))]
+        
+        self.collection.add(
+            embeddings=embeddings.tolist(),
+            documents=texts,
+            metadatas=metadatas,
+            ids=ids
+        )
+        return len(texts)
+    
+    def similarity_search(self, query_embedding: np.ndarray, k: int = 5) -> Dict[str, Any]:
+        """Search for similar documents"""
+        results = self.collection.query(
+            query_embeddings=[query_embedding.tolist()],
+            n_results=k
+        )
+        return results
+
+@st.cache_resource
+def load_local_llm():
+    """Load and cache local LLM"""
+    try:
+        # Try different model configurations
+        model_configs = [
+            {
+                "model_path": "TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
+                "model_file": "mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+                "model_type": "mistral"
+            },
+            {
+                "model_path": "TheBloke/Mistral-7B-Instruct-v0.1-GGUF", 
+                "model_file": "mistral-7b-instruct-v0.1.Q4_0.gguf",
+                "model_type": "mistral"
+            },
+            {
+                "model_path": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+                "model_file": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf", 
+                "model_type": "llama"
+            }
+        ]
+        
+        for config in model_configs:
+            try:
+                llm = AutoModelForCausalLM.from_pretrained(
+                    config["model_path"],
+                    model_file=config["model_file"],
+                    model_type=config["model_type"],
+                    gpu_layers=0,  # CPU only for Streamlit Cloud
+                    context_length=2048,
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    repetition_penalty=1.1
+                )
+                st.success(f"Loaded model: {config['model_path']}")
+                return llm
+            except Exception as e:
+                st.warning(f"Failed to load {config['model_path']}: {str(e)}")
+                continue
+        
+        raise Exception("All model configurations failed")
+        
+    except Exception as e:
+        st.error(f"Failed to load any LLM model: {str(e)}")
+        return None
+
+class RAGPipeline:
+    """Complete RAG pipeline for Streamlit"""
+    
+    def __init__(self):
+        self.doc_processor = DocumentProcessor()
+        self.text_chunker = TextChunker(chunk_size=800, overlap=100)
+        self.embedding_model = load_embedding_model()
+        self.vector_store = ChromaVectorStore()
+        self.llm = None
+    
+    def process_uploaded_files(self, uploaded_files) -> int:
+        """Process uploaded files and add to vector store"""
+        if not uploaded_files:
+            return 0
+        
+        # Clear previous documents
+        self.vector_store.clear_collection()
+        
+        all_chunks = []
+        all_metadatas = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, uploaded_file in enumerate(uploaded_files):
+            status_text.text(f"Processing: {uploaded_file.name}")
+            
+            # Read file bytes
+            file_bytes = uploaded_file.read()
+            
+            # Extract text
+            try:
+                text = self.doc_processor.load_document(uploaded_file.name, file_bytes)
+                chunks = self.text_chunker.chunk_text(text)
+                
+                # Create metadata
+                metadatas = [
+                    {
+                        "source": uploaded_file.name,
+                        "chunk_id": j,
+                        "file_type": Path(uploaded_file.name).suffix.lower()
+                    } 
+                    for j in range(len(chunks))
+                ]
+                
+                all_chunks.extend(chunks)
+                all_metadatas.extend(metadatas)
+                
+            except Exception as e:
+                st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+                continue
+            
+            progress_bar.progress((i + 1) / len(uploaded_files))
+        
+        if all_chunks:
+            status_text.text("Generating embeddings...")
+            
+            # Generate embeddings in batches to avoid memory issues
+            batch_size = 50
+            total_chunks = 0
+            
+            for i in range(0, len(all_chunks), batch_size):
+                batch_chunks = all_chunks[i:i + batch_size]
+                batch_metadatas = all_metadatas[i:i + batch_size]
+                
+                embeddings = self.embedding_model.encode(batch_chunks, convert_to_numpy=True)
+                added = self.vector_store.add_documents(batch_chunks, embeddings, batch_metadatas)
+                total_chunks += added
+                
+                progress_bar.progress(min(1.0, (i + batch_size) / len(all_chunks)))
+            
+            status_text.text(f"✅ Successfully processed {total_chunks} chunks from {len(uploaded_files)} files")
+            return total_chunks
+        
+        return 0
+    
+    def retrieve_context(self, query: str, k: int = 5) -> List[str]:
+        """Retrieve relevant context for a query"""
+        query_embedding = self.embedding_model.encode([query], convert_to_numpy=True)[0]
+        results = self.vector_store.similarity_search(query_embedding, k=k)
+        contexts = results['documents'][0] if results['documents'] else []
+        return contexts
+    
+    def generate_answer(self, query: str, context: List[str]) -> str:
+        """Generate answer using retrieved context and local LLM"""
+        if self.llm is None:
+            with st.spinner("Loading language model... This may take a few minutes."):
+                self.llm = load_local_llm()
+        
+        if self.llm is None:
+            return "❌ Language model failed to load. Please try again or check your setup."
+        
+        # Create prompt with context
+        context_text = "\n\n".join(context[:3])  # Limit context to avoid token limits
+        
+        prompt = f"""[INST] You are a helpful assistant that answers questions based on the provided context. 
+Use only the information from the context to answer the question clearly and concisely. 
+If the answer is not in the context, say "I cannot find this information in the provided documents."
+
+Context:
+{context_text}
+
+Question: {query}
+
+Answer: [/INST]"""
         
         try:
-            if use_openai and self.qa_chain:
-                result = self.qa_chain({"query": question})
-                return result["result"]
-            else:
-                # Use similarity search with simple answer generation
-                relevant_docs = self.vector_store.similarity_search(question, k=3)
-                context = "\n".join([doc.page_content for doc in relevant_docs])
-                
-                # Simple context-based answer (you can enhance this)
-                return f"Based on the document content:\n\n{context[:1000]}..."
-                
+            response = self.llm(prompt)
+            return response.strip()
         except Exception as e:
-            return f"Error generating answer: {str(e)}"
+            return f"❌ Error generating response: {str(e)}"
     
-    def save_vector_store(self, filename="vector_store.pkl"):
-        """Save the vector store for later use"""
-        if self.vector_store:
-            with open(filename, "wb") as f:
-                pickle.dump(self.vector_store, f)
-            return True
-        return False
-    
-    def load_vector_store(self, filename="vector_store.pkl"):
-        """Load a saved vector store"""
-        try:
-            if os.path.exists(filename):
-                with open(filename, "rb") as f:
-                    self.vector_store = pickle.load(f)
-                return True
-        except Exception as e:
-            st.error(f"Error loading vector store: {str(e)}")
-        return False
+    def query(self, question: str, k: int = 5) -> Dict[str, Any]:
+        """Complete RAG pipeline query"""
+        # Retrieve context
+        context = self.retrieve_context(question, k=k)
+        
+        if not context:
+            return {
+                "question": question,
+                "answer": "No relevant context found. Please upload some documents first.",
+                "context": []
+            }
+        
+        # Generate answer
+        answer = self.generate_answer(question, context)
+        
+        return {
+            "question": question,
+            "answer": answer,
+            "context": context
+        }
 
 def main():
-    st.set_page_config(
-        page_title="PDF Question-Answering System",
-        page_icon="📚",
-        layout="wide"
-    )
+    st.title("🤖 RAG Document Q&A System")
+    st.markdown("Upload documents and ask questions about their content!")
     
-    st.title("📚 PDF Question-Answering System")
-    st.markdown("Upload a PDF and ask questions about its content!")
+    # Initialize RAG pipeline
+    if 'rag_pipeline' not in st.session_state:
+        st.session_state.rag_pipeline = RAGPipeline()
     
-    # Initialize the QA system
-    if 'qa_system' not in st.session_state:
-        st.session_state.qa_system = PDFQASystem()
+    # Initialize chat history
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
     
-    # Sidebar for configuration
+    # Initialize document count
+    if 'document_count' not in st.session_state:
+        st.session_state.document_count = 0
+    
+    # Sidebar for file upload
     with st.sidebar:
-        st.header("⚙️ Configuration")
+        st.header("📁 Upload Documents")
         
-        # OpenAI API Key input
-        openai_api_key = st.text_input(
-            "OpenAI API Key (Optional)", 
-            type="password",
-            help="Enter your OpenAI API key for better answers. Leave empty to use free alternatives."
+        uploaded_files = st.file_uploader(
+            "Choose files",
+            type=['pdf', 'txt', 'docx'],
+            accept_multiple_files=True,
+            help="Upload PDF, TXT, or DOCX files"
         )
         
-        # Model selection
-        use_openai = st.checkbox(
-            "Use OpenAI GPT", 
-            value=bool(openai_api_key),
-            disabled=not bool(openai_api_key)
-        )
+        if uploaded_files:
+            if st.button("Process Documents", type="primary"):
+                with st.spinner("Processing documents..."):
+                    chunk_count = st.session_state.rag_pipeline.process_uploaded_files(uploaded_files)
+                    st.session_state.document_count = chunk_count
+                    if chunk_count > 0:
+                        st.success(f"✅ Processed {chunk_count} text chunks!")
+                        # Clear chat history when new documents are uploaded
+                        st.session_state.messages = []
         
-        st.markdown("---")
-        st.markdown("### 📋 Instructions")
-        st.markdown("""
-        1. Upload a PDF file
-        2. Wait for processing to complete
-        3. Ask questions about the content
-        4. Get precise answers based on the document
-        """)
+        # Document status
+        if st.session_state.document_count > 0:
+            st.info(f"📊 {st.session_state.document_count} chunks ready for Q&A")
+        else:
+            st.warning("No documents processed yet")
+        
+        # Settings
+        st.header("⚙️ Settings")
+        context_chunks = st.slider("Context chunks to retrieve", 1, 10, 5)
+        
+        # Clear conversation
+        if st.button("🗑️ Clear Conversation"):
+            st.session_state.messages = []
+            st.rerun()
     
-    # Main content area
-    col1, col2 = st.columns([1, 1])
+    # Main chat interface
+    st.header("💬 Ask Questions About Your Documents")
     
-    with col1:
-        st.header("📄 PDF Upload & Processing")
-        
-        # PDF upload
-        uploaded_file = st.file_uploader(
-            "Choose a PDF file", 
-            type="pdf",
-            help="Upload the PDF document you want to query"
-        )
-        
-        if uploaded_file is not None:
-            # Display PDF info
-            st.info(f"📁 File: {uploaded_file.name}")
-            st.info(f"📊 Size: {len(uploaded_file.read())/1024:.1f} KB")
-            uploaded_file.seek(0)  # Reset file pointer
-            
-            # Process PDF button
-            if st.button("🔄 Process PDF", type="primary"):
-                with st.spinner("Processing PDF..."):
-                    # Extract text
-                    text = st.session_state.qa_system.extract_text_from_pdf(uploaded_file)
-                    
-                    if text:
-                        # Create chunks
-                        documents = st.session_state.qa_system.create_chunks(text)
-                        st.success(f"Created {len(documents)} text chunks")
-                        
-                        # Create vector store
-                        if st.session_state.qa_system.create_vector_store(documents):
-                            st.success("✅ Vector store created successfully!")
-                            
-                            # Setup QA chain
-                            st.session_state.qa_system.setup_qa_chain(openai_api_key)
-                            
-                            # Save vector store
-                            if st.session_state.qa_system.save_vector_store():
-                                st.success("💾 Vector store saved!")
-                        else:
-                            st.error("❌ Failed to create vector store")
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message["role"] == "assistant" and "context" in message:
+                with st.expander("📚 View Source Context"):
+                    for i, ctx in enumerate(message["context"][:3]):
+                        st.markdown(f"**Chunk {i+1}:**")
+                        st.markdown(ctx[:300] + "..." if len(ctx) > 300 else ctx)
+                        st.markdown("---")
     
-    with col2:
-        st.header("❓ Ask Questions")
+    # Chat input
+    if prompt := st.chat_input("Ask a question about your documents..."):
+        if st.session_state.document_count == 0:
+            st.error("Please upload and process some documents first!")
+            return
         
-        # Question input
-        question = st.text_area(
-            "Enter your question about the PDF:",
-            height=100,
-            placeholder="e.g., What is the main topic discussed in this document?"
-        )
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
         
-        # Answer button
-        if st.button("🔍 Get Answer", type="primary"):
-            if question.strip():
-                if st.session_state.qa_system.vector_store is not None:
-                    with st.spinner("Generating answer..."):
-                        answer = st.session_state.qa_system.answer_question(
-                            question, 
-                            use_openai=use_openai,
-                            openai_api_key=openai_api_key
-                        )
-                        
-                        st.markdown("### 💡 Answer:")
-                        st.markdown(answer)
-                else:
-                    st.warning("⚠️ Please upload and process a PDF first!")
-            else:
-                st.warning("⚠️ Please enter a question!")
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(prompt)
         
-        # Example questions
-        if st.session_state.qa_system.vector_store is not None:
-            st.markdown("### 💭 Example Questions:")
-            example_questions = [
-                "What is the main topic of this document?",
-                "Can you summarize the key points?",
-                "What are the conclusions mentioned?",
-                "Are there any specific dates or numbers mentioned?"
-            ]
-            
-            for i, eq in enumerate(example_questions):
-                if st.button(f"📝 {eq}", key=f"example_{i}"):
-                    with st.spinner("Generating answer..."):
-                        answer = st.session_state.qa_system.answer_question(
-                            eq,
-                            use_openai=use_openai,
-                            openai_api_key=openai_api_key
-                        )
-                        st.markdown("### 💡 Answer:")
-                        st.markdown(answer)
+        # Generate and display assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                result = st.session_state.rag_pipeline.query(prompt, k=context_chunks)
+                
+                st.markdown(result["answer"])
+                
+                # Add assistant message to chat history
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": result["answer"],
+                    "context": result["context"]
+                })
     
     # Footer
     st.markdown("---")
-    st.markdown(
-        "💡 **Tip:** For better results, use specific questions and consider providing an OpenAI API key."
-    )
+    st.markdown("🚀 Powered by Streamlit | 🧠 Local LLM | 🔒 Privacy-First")
 
 if __name__ == "__main__":
     main()
